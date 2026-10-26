@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sync_services_from_json.py
-==========================
-همگام‌سازی جدول services دیتابیس SQLite با فایل JSON خدمات
+sync_services_from_json.py  (نسخه جایگزینی کامل)
+================================================
+۱) همه خدمات قبلیِ جدول services دیتابیس حذف می‌شوند
+۲) همه خدمات فایل JSON از نو اضافه می‌شوند
 
-قواعد همگام‌سازی:
-    1. خدماتی که فقط در JSON هستند  →  به دیتابیس اضافه می‌شوند
-    2. خدماتی که فقط در دیتابیس هستند  →  از دیتابیس حذف می‌شوند
-    3. خدمات مشترک (تطبیق با عنوان)  →  فقط مقادیر JSON به‌روزرسانی می‌شوند
-
-فیلدهایی که از JSON وارد می‌شوند:
+فیلدهایی که از JSON وارد می‌شوند (فقط همین‌ها):
     price, description, noticeType, noticeText, title, benefit
 
 نگاشت به ستون‌های دیتابیس:
     price       →  base_price   (ستون موجود)
     description →  description  (ستون موجود)
     title       →  title        (ستون موجود)
-    noticeType  →  notice_type  (ستون جدید - خودکار ساخته می‌شود)
-    noticeText  →  notice_text  (ستون جدید - خودکار ساخته می‌شود)
-    benefit     →  benefit      (ستون جدید - خودکار ساخته می‌شود)
+    noticeType  →  notice_type  (ستون جدید - در صورت نبود خودکار ساخته می‌شود)
+    noticeText  →  notice_text  (ستون جدید - در صورت نبود خودکار ساخته می‌شود)
+    benefit     →  benefit      (ستون جدید - در صورت نبود خودکار ساخته می‌شود)
 
-نکته: ستون estimated_time (زمان انجام کار) دست نمی‌خورد و همان مقدار
-قبلی دیتابیس برای خدمات جدید هم استفاده می‌شود.
+نکته: ستون estimated_time (زمان انجام کار) همان مقدار قبلی دیتابیس است
+(رایج‌ترین مقدار موجود قبل از حذف، مثلا «۳۰ الی ۶۰ دقیقه»).
 
 نحوه اجرا:
     python sync_services_from_json.py                       # فایل‌ها را خودکار پیدا می‌کند
@@ -31,24 +27,21 @@ sync_services_from_json.py
 
 امکانات:
     - بکاپ خودکار از دیتابیس قبل از تغییر (با تاریخ و ساعت)
-    - تطبیق هوشمند عناوین فارسی (نیم‌فاصله، اعداد فارسی، فاصله‌های اضافی)
     - اجرای تراکنشی و امن (در صورت خطا rollback کامل)
-    - گزارش کامل قبل/بعد
+    - گزارش کامل و تأیید نهایی
 """
 
 import json
-import re
 import shutil
 import sqlite3
 import sys
-import unicodedata
 from datetime import datetime
 from pathlib import Path
 
 # ------------------------------------------------- تنظیمات نگاشت فیلدها ----
 # کلید JSON  →  ستون دیتابیس
 FIELD_MAP = {
-    "price": "base_price",       # موجود
+    "price": "base_price",         # موجود
     "description": "description",  # موجود
     "title": "title",              # موجود
     "noticeType": "notice_type",   # جدید
@@ -71,18 +64,6 @@ DEFAULT_ESTIMATED_TIME_FALLBACK = "۳۰ الی ۶۰ دقیقه"
 
 
 # ------------------------------------------------------------ توابع کمکی ---
-def normalize_title(s: str) -> str:
-    """نرمال‌سازی عنوان فارسی برای تطبیق مطمئن:
-    یکسان‌سازی نیم‌فاصله، حروف عربی/فارسی، اعداد فارسی و فاصله‌ها."""
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\u200c", " ").replace("\u200f", "").replace("\u200e", "")
-    s = s.replace("ي", "ی").replace("ك", "ک")
-    for fa, en in zip("۰۱۲۳۴۵۶۷۸۹", "0123456789"):
-        s = s.replace(fa, en)
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s
-
-
 def find_files(argv: list[str]) -> tuple[Path, Path]:
     """پیدا کردن فایل JSON و دیتابیس از آرگومان‌ها یا پوشه فعلی."""
     given = [Path(a) for a in argv if not a.startswith("--")]
@@ -130,8 +111,8 @@ def make_backup(db_path: Path) -> Path:
 
 
 def pick_default_values(cur: sqlite3.Cursor) -> dict:
-    """مقادیر پیش‌فرض برای ردیف‌های جدید، بر اساس مقادیر موجود در دیتابیس."""
-    # مقدار رایج estimated_time در دیتابیس فعلی (همان مقدار قبلی)
+    """مقادیر پیش‌فرض بر اساس وضعیت فعلی دیتابیس (قبل از حذف)."""
+    # مقدار رایج estimated_time در دیتابیس فعلی = همان مقدار قبلی
     row = cur.execute(
         "SELECT estimated_time, COUNT(*) AS c FROM services "
         "GROUP BY estimated_time ORDER BY c DESC LIMIT 1"
@@ -162,38 +143,20 @@ def main() -> None:
     cur = con.cursor()
     defaults = pick_default_values(cur)
 
-    # --- خواندن خدمات فعلی دیتابیس و تطبیق با عنوان نرمال‌شده ---
-    db_rows = cur.execute(
-        "SELECT id, title FROM services"
-    ).fetchall()
-    db_by_norm: dict[str, list[tuple[str, str]]] = {}
-    for service_id, title in db_rows:
-        db_by_norm.setdefault(normalize_title(title), []).append((service_id, title))
+    old_count = cur.execute("SELECT COUNT(*) FROM services").fetchone()[0]
+    orders_ref = cur.execute(
+        "SELECT COUNT(*) FROM orders WHERE service_id IS NOT NULL"
+    ).fetchone()[0]
 
-    json_by_norm: dict[str, dict] = {}
-    for it in items:
-        json_by_norm[normalize_title(it["title"])] = it
+    print(f"خدمات فعلی دیتابیس: {old_count}  ← همه حذف می‌شوند")
+    print(f"خدمات JSON: {len(items)}  ← همه اضافه می‌شوند")
+    print(f"زمان انجام کار خدمات جدید (مقدار قبلی دیتابیس): {defaults['estimated_time']!r}")
+    print(f"دسته‌بندی خدمات جدید: {defaults['category_id']}")
+    print(f"سفارش‌های تاریخی که به خدمات اشاره می‌کنند (حفظ می‌شوند): {orders_ref}\n")
 
-    matched_norms = set(db_by_norm) & set(json_by_norm)
-    add_norms = set(json_by_norm) - set(db_by_norm)
-    delete_norms = set(db_by_norm) - set(json_by_norm)
-
-    to_update = [json_by_norm[n] for n in sorted(matched_norms)]
-    to_add = [json_by_norm[n] for n in sorted(add_norms)]
-    to_delete = [sid for n in sorted(delete_norms) for sid, _t in db_by_norm[n]]
-
-    print(f"خدمات JSON: {len(items)} | خدمات دیتابیس: {len(db_rows)}")
-    print(f"مشترک (به‌روزرسانی): {len(to_update)}")
-    print(f"فقط JSON (اضافه): {len(to_add)}")
-    print(f"فقط دیتابیس (حذف): {len(to_delete)}\n")
-
-    print("--- نمونه خدمات جدید (اولین ۵ مورد) ---")
-    for it in to_add[:5]:
-        print(f"  + {it['title']}")
-    print("--- نمونه خدمات حذفی (اولین ۵ مورد) ---")
-    titles_lookup = {sid: t for sid, t in db_rows}
-    for sid in to_delete[:5]:
-        print(f"  - {titles_lookup.get(sid, sid)}")
+    print("--- نمونه خدمات JSON (اولین ۵ مورد) ---")
+    for it in items[:5]:
+        print(f"  + {it['title']}  (price={it.get('price')}, benefit={it.get('benefit')})")
     print()
 
     if dry_run:
@@ -209,66 +172,37 @@ def main() -> None:
     if created_cols:
         print(f"ستون‌های جدید ساخته شد: {', '.join(created_cols)}")
 
-    used_ids = {sid for sid, _t in db_rows}
     try:
         cur.execute("BEGIN")
 
-        # ۱) به‌روزرسانی خدمات مشترک (estimated_time دست نمی‌خورد)
-        cur.executemany(
-            """UPDATE services SET
-                   title = ?, base_price = ?, description = ?,
-                   notice_type = ?, notice_text = ?, benefit = ?
-               WHERE id = ?""",
-            [
-                (
-                    it["title"],
-                    it.get("price"),
-                    it.get("description"),
-                    it.get("noticeType"),
-                    it.get("noticeText"),
-                    it.get("benefit"),
-                    sid,
-                )
-                for it in to_update
-                for (sid, _t) in db_by_norm[normalize_title(it["title"])]
-            ],
-        )
+        # ۱) حذف همه خدمات قبلی
+        cur.execute("DELETE FROM services")
 
-        # ۲) حذف خدمات اضافی (سفارش‌های تاریخی حفظ می‌شوند)
-        cur.executemany(
-            "DELETE FROM services WHERE id = ?",
-            [(sid,) for sid in to_delete],
-        )
-
-        # ۳) افزودن خدمات جدید از JSON
+        # ۲) افزودن همه خدمات JSON
         insert_rows = []
-        for it in to_add:
-            new_id = f"srv-{it['id']}"
-            while new_id in used_ids:
-                new_id += "-x"
-            used_ids.add(new_id)
+        for i, it in enumerate(items):
             slug = (it["title"] or "").replace(" ", "-")
             insert_rows.append(
                 (
-                    new_id,
-                    defaults["category_id"],
-                    it["title"],
-                    it.get("description"),
-                    it.get("price"),
-                    defaults["estimated_time"],  # همان مقدار قبلی دیتابیس
-                    None,          # icon
-                    1,             # is_active
-                    "[]",          # fields_json
-                    "",            # pricing_formula
-                    None,          # icon_color
-                    0,             # sort_order
-                    0,             # is_featured
-                    0,             # featured_sort
-                    slug,
-                    None,          # created_at
-                    it.get("noticeType"),
-                    it.get("noticeText"),
-                    it.get("benefit"),
+                    f"srv-{it['id']}",                      # id
+                    defaults["category_id"],                 # category_id
+                    it["title"],                             # title
+                    it.get("description"),                   # description
+                    it.get("price"),                         # base_price
+                    defaults["estimated_time"],              # estimated_time (مقدار قبلی دیتابیس)
+                    None,                                    # icon
+                    1,                                       # is_active
+                    "[]",                                    # fields_json
+                    "",                                      # pricing_formula
+                    None,                                    # icon_color
+                    i,                                       # sort_order (ترتیب JSON)
+                    0,                                       # is_featured
+                    0,                                       # featured_sort
+                    slug,                                    # slug
+                    None,                                    # created_at
+                    it.get("noticeType"),                    # notice_type
+                    it.get("noticeText"),                    # notice_text
+                    it.get("benefit"),                       # benefit
                 )
             )
         cur.executemany(
@@ -290,14 +224,19 @@ def main() -> None:
 
     # --- تأیید نهایی ---
     total = cur.execute("SELECT COUNT(*) FROM services").fetchone()[0]
+    distinct_time = [
+        r[0] for r in cur.execute("SELECT DISTINCT estimated_time FROM services").fetchall()
+    ]
     cols = {row[1] for row in cur.execute("PRAGMA table_info(services)").fetchall()}
     con.close()
 
     print("\n--- نتیجه ---")
-    print(f"تعداد خدمات پس از همگام‌سازی: {total} (انتظار: {len(items)})")
+    print(f"خدمات قبلی حذف‌شده: {old_count}")
+    print(f"خدمات جدید اضافه‌شده: {total} (انتظار: {len(items)})")
+    print(f"مقادیر estimated_time: {distinct_time}")
     print(f"ستون‌های جدول services: {sorted(cols)}")
     if total == len(items):
-        print("✅ همگام‌سازی با موفقیت انجام شد.")
+        print("✅ جایگزینی کامل خدمات با موفقیت انجام شد.")
     else:
         print("⚠️ تعداد نهایی با JSON یکسان نیست؛ فایل بکاپ را بررسی کنید.")
 
